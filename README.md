@@ -1,5 +1,7 @@
 # agent-command-guard
 
+[![tests](https://github.com/Dheightsan/agent-command-guard/actions/workflows/tests.yml/badge.svg)](https://github.com/Dheightsan/agent-command-guard/actions/workflows/tests.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Dheightsan/agent-command-guard/badge)](https://scorecard.dev/viewer/?uri=github.com/Dheightsan/agent-command-guard)
+
 A small hook that stops a coding agent from running a few commands you can't take back. It's one Python file with no dependencies.
 
 I run Claude Code on my own Windows laptop for many hours a day, in Git Bash and PowerShell. This is the guard I use there. I wrote it with Claude Code itself. Most rules came after an agent did something bad on my machine, the rest after I found a hole while testing.
@@ -75,6 +77,10 @@ This reads the command as text, so it catches mistakes. An agent that wants to g
 - A path read into a variable, like `IFS=~ read -r a b <<< "x/y"; rm -rf "$a"` (the one nah case that passes)
 
 For a real boundary you need a container or a separate user account.
+
+## Security
+
+Bypasses that aren't listed above go through [SECURITY.md](SECURITY.md), not public issues.
 
 ## License
 
