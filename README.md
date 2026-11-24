@@ -14,8 +14,9 @@ I run Claude Code on my own Windows laptop for many hours a day, in Git Bash and
 - `find /` on a whole drive without `-maxdepth`. On Windows a stray one left millions of open handles and ate GBs of kernel memory twice.
 - `git reset --hard` and `git push --force`. `--force-with-lease` still works.
 - The same rules inside `bash -c '...'` and `python -c '...'`, up to three levels deep.
+- The same deletes when they're hidden, like `timeout 5 rm -rf ~`, `su -c '...'`, `"r""m" -rf ~`, `X=rm; $X -rf ~`, `echo ~ | xargs rm -rf`, `find ~ -delete`, a `for` loop over protected paths, or `shutil.rmtree` and `execSync` with the path inside. It resolves `..` and `/mnt/c` in a path before it checks it.
 
-Mentioning a dangerous command inside a commit message, a grep or a heredoc doesn't trigger it. I ran it over 50,220 real Bash and PowerShell commands from my own agent sessions. It blocked 59 of them, about 0.1%. Most were real hits, like 31 `find` runs over a whole drive and 12 reads of `gradle.properties`. A few were false alarms, mostly a PR body or heredoc whose text looked like a command. The older version I had blocked 58 on the same set.
+Mentioning a dangerous command inside a commit message, a grep or a heredoc doesn't trigger it. I ran it over 52,321 real Bash and PowerShell commands from 30 days of my own agent sessions. It blocked 75 of them, about 0.1%. Most were real hits, like `find` runs over a whole drive and reads of `gradle.properties`. A few were false alarms, mostly a PR body or heredoc whose text looked like a command. My first version blocked 74. The extra one is a heredoc that wrote a test file full of attacks. Each call takes around 2 ms.
 
 ## Install (Claude Code)
 
@@ -58,18 +59,20 @@ Optional. Copy `guard.config.example.json` to `guard.config.json` next to `guard
 python -m unittest discover -s tests -v
 ```
 
-The tests have three groups: the normal cases, the bypasses I found in my own earlier version and closed here, and the known gaps below. The gaps are written as expected failures, so if one gets fixed the test run tells you.
+The tests have four groups: the normal cases, the bypasses I found in my own earlier version, the disguised deletes, and the known gaps below. The gaps are written as expected failures, so if one gets fixed the test run tells you.
+
+Most of the hidden deletes come from the adversarial corpus of [nah](https://github.com/manuelschipper/nah), which is MIT. It has 49 ways to write `rm -rf` on a root and I swapped the target for the home folder and a protected repo. My first version stopped 14 of them. This one stops 48.
 
 ## Known gaps
 
 This reads the command as text, so it catches mistakes. An agent that wants to get around it can. These still pass:
 
-- `eval "rm -rf ~"` and `$(rm -rf ~)`
-- `echo ~ | xargs rm -rf`, where the target arrives through stdin
-- PowerShell pipelines like `Get-Item C:\Users\me | Remove-Item -Recurse`, and .NET calls like `[IO.Directory]::Delete(...)`
-- `find ~ -delete`
-- A path built from pieces, like `a=/c/Users; b=me; rm -rf $a/$b`
-- Writing a script to a file and running it in a second step
+- `echo $(rm -rf ~)` and a script written to a file and run in a second step
+- An encoded command, like `echo ... | base64 -d | sh`
+- `cd ~ && rm -rf *`, where the danger is in the folder you're standing in
+- `rm -rf $X/` when nothing in the command sets `X`
+- `mv ~ /tmp/x`, `rsync --delete` into the home, and PowerShell's `$_.Delete()` inside a loop
+- A path read into a variable, like `IFS=~ read -r a b <<< "x/y"; rm -rf "$a"` (the one nah case that passes)
 
 For a real boundary you need a container or a separate user account.
 

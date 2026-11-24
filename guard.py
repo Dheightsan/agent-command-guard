@@ -25,10 +25,15 @@ PREFIX = "[agent-guard]"
 # A protected path can't be deleted whole (with or without /*), and neither can its .git folder.
 
 _HOME = (
-    r"(?:~|\$home|\$\{home\}|\$env:userprofile|%userprofile%|"
+    r"(?:~|\$home|\$\{home\}|\$userprofile|\$\{userprofile\}|\$env:userprofile|\$env:home|%userprofile%|"
     r"[a-z]:[\\/]users[\\/][^\\/*]+|/[a-z]/users/[^/*]+|/home/[^/*]+|/users/[^/*]+|/root)"
 )
-_HOME_DIRS = r"\.claude|\.ssh|\.gradle|\.config|\.aws|\.gnupg|documents|desktop|onedrive|appdata"
+# Folders of the home that are never deleted whole. The .claude subfolders hold work that isn't
+# regenerated (transcripts, skills, hooks, rules, agents); a deeper subfolder still passes.
+_HOME_DIRS = (
+    r"\.claude(?:[\\/](?:projects|skills|hooks|rules|agents))?|\.ssh|\.gradle|\.config|\.aws|\.gnupg|"
+    r"documents|desktop|onedrive|appdata(?:[\\/](?:local|roaming))?"
+)
 
 _RAIZ = None
 _GIT_DIR = None
@@ -52,7 +57,10 @@ def configure(protected_paths=()):
     proyectos = "".join("|" + e + r"[\\/]?\*?" for e in extra)
     _RAIZ = re.compile(
         r"[a-z]:[\\/]?\*?|/\*?|/[a-z]/?\*?|"
-        + _HOME + r"(?:[\\/](?:" + _HOME_DIRS + r"))?[\\/]?\*?"
+        + _HOME + r"(?:[\\/](?:" + _HOME_DIRS + r"))?[\\/]?\*?|"
+        + _HOME + r"[\\/]\.\.(?:[\\/].*)?|"  # ~/.. climbs out of the home
+        r"(?:[a-z]:[\\/]|/[a-z]/)(?:users|windows)[\\/]?\*?|/home[\\/]?\*?|/users[\\/]?\*?|"
+        r"(?:\$env:|\$|%)(?:appdata|localappdata|onedrive)%?[\\/]?\*?"
         + proyectos
     )
     # The .git folder of the current repo (".git", "./.git") or of a protected path. With any other
@@ -114,8 +122,30 @@ def check_command(command, nivel=0):
     """Returns the block reason for a shell command (Bash, PowerShell or cmd), or None.
     nivel counts the wrappers already opened (bash -c, python -c), up to 3."""
     command = command.lower()
+    motivo = _revisar(command, nivel)
+    if motivo or nivel:
+        return motivo
+    # The same command as the shell would see it (continued lines joined, $'\x72\x6d' decoded),
+    # and then with the variables that the command itself sets replaced (X=rm; $X -rf ~).
+    normal = _normalizar(command)
+    if normal != command:
+        motivo = _revisar(normal, 0)
+    if not motivo and _SOSPECHA.search(normal.replace('"', "").replace("'", "").replace("\\", "")):
+        expandido = _expandir(normal)
+        if expandido != normal and (_borra_raiz(expandido) or _borra_disfrazado(expandido, 0)):
+            motivo = _MSG_DESTRUCTIVO + " (after replacing the variables the command sets)"
+    return motivo
+
+
+def _revisar(command, nivel):
     if re.search(r"\bformat\s+[a-z]:", command) or _borra_raiz(command):
         return PREFIX + " Blocked: deletes a drive root, the home folder, a protected path or a .git folder."
+
+    if _borra_disfrazado(command, nivel):
+        return (
+            _MSG_DESTRUCTIVO + ", behind a wrapper (timeout, eval, sudo -u, su -c, trap, xargs...), a pipe, "
+            "a loop or a call (os.system, rmtree, execSync). If the delete is legit, write the exact subfolder."
+        )
 
     if _borra_variable(command):
         return (
@@ -150,7 +180,7 @@ def check_command(command, nivel=0):
 
     if nivel < 3:
         for cuerpo, es_python in _envueltos(command):
-            motivo = _python_destructivo(cuerpo, nivel) if es_python else check_command(cuerpo, nivel + 1)
+            motivo = _python_destructivo(cuerpo, nivel) if es_python else _revisar(cuerpo, nivel + 1)
             if motivo:
                 return motivo + " (inside bash -c or python -c)"
     return None
@@ -223,9 +253,7 @@ def _borra_raiz(command):
             palabra = palabra.strip("'\"(),")
             if es_cmd and re.fullmatch(r"/[a-z?]", palabra):
                 continue  # del /f /q, rd /s: switches, not drives
-            if palabra.startswith(("-path:", "-literalpath:")):
-                palabra = palabra.split(":", 1)[1].strip("'\"")
-            if _RAIZ.fullmatch(palabra) or _GIT_DIR.fullmatch(palabra):
+            if _protegida(palabra):
                 return True
     return False
 
@@ -246,8 +274,306 @@ def _borra_variable(command):
                 continue
             nombre = re.sub(r"^\$(?:env:)?\{?|\}$", "", palabra)
             valor = asignadas.get(nombre)
-            if valor is not None and (_RAIZ.fullmatch(valor.lower()) or len(valor.strip("/\\")) < 4):
+            if valor is not None and (_protegida(valor.lower()) or len(valor.strip("/\\")) < 4):
                 return True
+    return False
+
+
+def _ruta(palabra):
+    """The path as it resolves: no quotes, / instead of \\, no //, /./ or x/.., and /mnt/c or
+    /cygdrive/c as /c. So /c/Users/me/../me, "$HOME"/ and C:\\work\\.\\ don't slip through."""
+    p = palabra.replace('"', "").replace("'", "").strip("(),;")
+    if p.startswith(("-path:", "-literalpath:")):
+        p = p.split(":", 1)[1]
+    if p.startswith("\\\\?\\"):
+        p = p[4:]
+    q = p.replace("\\", "/")
+    if "/" not in q:
+        return p
+    q = re.sub(r"^/(?:mnt|cygdrive)/([a-z])(?=/|$)", r"/\1", q)
+    partes = []
+    for i, s in enumerate(q.split("/")):
+        if s == "." or (s == "" and i > 0):
+            continue
+        if (s == ".." and partes and partes[-1] not in ("", "..", "~")
+                and not partes[-1].startswith(("$", "%")) and not re.fullmatch(r"[a-z]:", partes[-1])):
+            partes.pop()
+            continue
+        partes.append(s)
+    r = "/".join(partes)
+    if r == "":
+        return "/" if q.startswith("/") else p
+    return r
+
+
+def _protegida(palabra):
+    """True if the word, once resolved, is a root, the home folder, a protected path or a .git folder."""
+    # A lone "\n" or "\t" is an escape inside some text, not drive /n.
+    if re.fullmatch(r"\\[a-z]", palabra.strip("'\"(),;")):
+        return False
+    r = _ruta(palabra)
+    return bool(r and (_RAIZ.fullmatch(r) or _GIT_DIR.fullmatch(r)))
+
+
+# ---- Disguised deletes ------------------------------------------------------------------------
+# Measured with the adversarial corpus of nah (MIT, 49 templates of rm -rf on a root): the guard
+# above alone blocked 14 of 49. What got through: rm behind a wrapper that isn't a known prefix
+# (timeout 5, eval, sudo -u x, setsid, docker exec...), inside a string another program runs
+# (su -c '...', trap '...', node -e, os.system), a disguised verb ("r""m", r\m, $'\x72\x6d',
+# X=rm; $X) or a delete split across a pipe or a loop. To avoid blocking prose (a report or a commit
+# message that names the command), the wrapper rules only look at segments whose first word runs
+# something.
+_MSG_DESTRUCTIVO = PREFIX + " Blocked: deletes a drive root, the home folder, a protected path or a .git folder"
+_SOSPECHA = re.compile(
+    r"\brm|remove-item|\brd\b|\bdel\b|\berase\b|delete|unlink|removedirs|remove_dir_all|"
+    r"(?:^|\s)-[a-z]*(?:r[a-z]*f|f[a-z]*r)[a-z]*(?=\s|$)"
+)
+_EJECUTOR = frozenset(
+    "eval su sudo doas runas script trap at batch crontab watch ssh wsl xargs parallel sh bash zsh dash ksh "
+    "fish node nodejs deno bun perl php ruby lua python python3 py pwsh powershell cmd env nohup timeout time "
+    "nice ionice chrt taskset stdbuf setsid flock chroot unshare nsenter systemd-run docker podman kubectl "
+    "exec command builtin strace ltrace busybox tmux screen expect find start-process saps invoke-expression "
+    "iex invoke-command icm start-job sajb schtasks wscript cscript mshta & .".split()
+)
+_VERBO_SUELTO = re.compile(r"(?:(?:/usr)?/bin/)?(?:rm|remove-item)(?:\.exe)?")
+_VERBO_TUBERIA = re.compile(r"(?:(?:/usr)?/bin/)?(?:rm|remove-item|ri|del|erase|rd|rmdir)(?:\.exe)?")
+_RF = re.compile(r"-[a-z]*[rf][a-z]*|--recursive|--force|/s|/q")
+_RF_AMBOS = re.compile(r"-(?=[a-z]*r)(?=[a-z]*f)[a-z]{2,4}")
+_RF_BORRA = re.compile(r"-r[a-z]*|-f|-fr|-fo(?:rce)?|--recursive|--force|/s|/q")
+_ANTES_VERBO = frozenset("xargs % foreach-object foreach sudo {".split())
+_ANSI_C = re.compile(r"\$'((?:\\.|[^'\\])*)'")
+_LLAMADA = re.compile(
+    r"(?:system|exec\w*|popen|spawn\w*|run|call|check_output|check_call|shell_exec|passthru|getoutput|"
+    r"getstatusoutput)\s*\(\s*(['\"])(.*?)(?<!\\)\1",
+    re.S,
+)
+_LLAMADA_LISTA = re.compile(
+    r"(?:run|call|popen|check_output|check_call|spawn\w*|exec\w*)\s*\(\s*((?:['\"][\w./\\-]*['\"]\s*,\s*)?)"
+    r"\[([^\]]*)\]"
+)
+_API_BORRA = re.compile(
+    r"(?:rmtree|os\.remove|os\.unlink|os\.rmdir|removedirs|rmsync|rmdirsync|unlinksync|fs\.rm|remove_dir_all|"
+    r"\[(?:system\.)?io\.(?:directory|file)\]::delete)\s*\(\s*r?(['\"])(.*?)(?<!\\)\1",
+    re.S,
+)
+_LISTA = frozenset("ls dir gci get-childitem get-item gi find echo printf write-output".split())
+_FILTRO = re.compile(r"(?:^|\s)-(?:filter|include|exclude|i?name|i?path|i?regex|mtime|mmin|newer|size|empty)\b")
+_FOR_SH = re.compile(r"\bfor\s+(\w+)\s+in\s+([^;\n]+?)\s*[;\n]\s*do\b(.*?)(?:\bdone\b|$)", re.S)
+_FOR_PS = re.compile(r"\bforeach\s*\(\s*\$(\w+)\s+in\s+([^)]*)\)\s*\{(.*?)\}", re.S)
+
+
+def _ansi_c(m):
+    s = re.sub(r"\\x([0-9a-f]{1,2})", lambda h: chr(int(h.group(1), 16)), m.group(1))
+    return re.sub(r"\\([0-7]{1,3})", lambda o: chr(int(o.group(1), 8)), s)
+
+
+def _normalizar(command):
+    """Joins lines continued with ' \\' or ' `' and decodes bash ANSI-C quotes."""
+    if "\n" in command:
+        command = re.sub(r"(?<=[ \t])[\\`]\r?\n[ \t]*", " ", command)
+    if "$'" in command:
+        command = _ANSI_C.sub(_ansi_c, command)
+    return command
+
+
+def _expandir(command):
+    """Replaces $X and ${X} with the literal value the same command assigns (X=rm; Z=/c/x)."""
+    asignadas = {}
+    for m in _ASIGNA.finditer(command):
+        valor = m.group(2).strip("'\"")
+        if valor and "$" not in valor and len(valor) < 200:
+            asignadas[m.group(1)] = valor
+    if not asignadas:
+        return command
+    return re.sub(
+        r"\$\{(\w+)\}|\$(\w+)",
+        lambda m: asignadas.get(m.group(1) or m.group(2), m.group(0)),
+        command,
+    )
+
+
+def _palabras(tramo):
+    """Shell words of a segment, without quotes: (text, is_phrase). A phrase is quoted text with
+    spaces. Outside quotes, spaces and ( ) ` , [ ] separate words."""
+    out, act, comilla, frase, hubo = [], [], None, False, False
+    i, n = 0, len(tramo)
+    while i < n:
+        c = tramo[i]
+        if comilla:
+            if c == "\\" and comilla == '"' and i + 1 < n and tramo[i + 1] in '"\\':
+                act.append(tramo[i + 1])
+                i += 2
+                continue
+            if c == comilla:
+                comilla = None
+            else:
+                act.append(c)
+                if c in " \t":
+                    frase = True
+        elif c in "'\"":
+            comilla, hubo = c, True
+        elif c in " \t()`,[]":
+            if act or hubo:
+                out.append(("".join(act), frase))
+            act, frase, hubo = [], False, False
+        else:
+            act.append(c)
+        i += 1
+    if act or hubo:
+        out.append(("".join(act), frase))
+    return out
+
+
+def _nombre(palabra):
+    """Program name: no path, no .exe, no escape backslashes."""
+    p = palabra.replace("\\", "/").rstrip("/")
+    p = p.rsplit("/", 1)[-1]
+    return p[:-4] if p.endswith(".exe") else p
+
+
+def _rm_con_destino(simples):
+    """True if the words hold an rm or Remove-Item followed by -r/-f and a protected target."""
+    for i, p in enumerate(simples):
+        if _VERBO_SUELTO.fullmatch(p.replace("\\", "")):
+            resto = simples[i + 1:]
+            if any(_RF.fullmatch(r) for r in resto) and any(_protegida(r) for r in resto):
+                return True
+    return False
+
+
+def _borra_disfrazado(command, nivel):
+    """True if the command deletes a protected target without rm at the start of a segment."""
+    if not _SOSPECHA.search(command.replace('"', "").replace("'", "").replace("\\", "")):
+        return False
+    for tramo in _tramos(command):
+        pal = _palabras(tramo)
+        if not pal:
+            continue
+        simples = [p for p, frase in pal if not frase]
+        crudo = tramo.lstrip(" \t(&{")
+        primera = _nombre(pal[0][0])
+        # $cmd at the start (not PowerShell's "$x = ..."), $(...) or `...`: the verb comes from a substitution.
+        var_cmd = bool(re.fullmatch(r"\$\{?\w+\}?", pal[0][0])) and not (len(pal) > 1 and pal[1][0].startswith("="))
+        ejecuta = (primera in _EJECUTOR or var_cmd or crudo.startswith(("$(", "`"))
+                   or bool(re.fullmatch(r"\w+=", pal[0][0])))
+        if simples and (ejecuta or _VERBO_SUELTO.fullmatch(simples[0].replace("\\", ""))):
+            if _rm_con_destino(simples):
+                return True
+        if var_cmd and len(simples) > 1:
+            # $cmd -rf /: we can't know what $cmd is, but -rf on a root has no healthy reading.
+            # Only short bash flags (-rf, -fr, -rfv): PowerShell's -Filter or -Force don't count.
+            if any(_RF_AMBOS.fullmatch(p) for p in simples[1:]) and any(_protegida(p) for p in simples[1:]):
+                return True
+        if nivel < 3 and (ejecuta or "<<<" in tramo):
+            for p, frase in pal:
+                if not frase:
+                    continue
+                if primera == "crontab":
+                    p = re.sub(r"^\s*(?:[\d*/,-]+\s+){5}", "", p)  # the cron schedule goes before the command
+                if _borra_raiz(p) or _borra_disfrazado(p, nivel + 1):
+                    return True
+    if nivel < 3:
+        for m in _LLAMADA.finditer(command):
+            lit = m.group(2).replace("\\'", "'").replace('\\"', '"')
+            if " " in lit and (_borra_raiz(lit) or _borra_disfrazado(lit, nivel + 1)):
+                return True
+    for m in _LLAMADA_LISTA.finditer(command):
+        if _rm_con_destino([p for p, _ in _palabras(m.group(1) + " " + m.group(2))]):
+            return True
+    for m in _API_BORRA.finditer(command):
+        if _protegida(m.group(2).replace("\\\\", "/").strip()):
+            return True
+    return _find_borra(command) or _borra_en_tuberia(command) or _bucle_borra(command)
+
+
+def _find_borra(command):
+    """find <protected target> -delete or -exec rm, without a name filter: deletes everything inside."""
+    for tramo in _tramos(command):
+        m = _FIND.match(tramo)
+        if not m:
+            continue
+        resto = m.group(1)
+        if not re.search(r"(?:^|\s)-delete\b|-(?:exec|execdir|ok)\s+\S*\brm\b", resto) or _FILTRO.search(resto):
+            continue
+        for palabra in resto.split():
+            if palabra.startswith(("-", "(", "!", "\\(")):
+                break
+            if _protegida(palabra):
+                return True
+    return False
+
+
+def _tuberias(command):
+    """Pipelines of the command: lists of stages split by | (not by ; && ||), without cutting quotes."""
+    for linea in command.split("\n"):
+        if "|" not in linea:
+            continue
+        etapas, actual, comilla, i = [], [], None, 0
+        while i < len(linea):
+            c = linea[i]
+            if comilla:
+                if c == comilla:
+                    comilla = None
+                actual.append(c)
+            elif c in "'\"":
+                comilla = c
+                actual.append(c)
+            elif c == ";" or linea.startswith(("&&", "||"), i):
+                etapas.append("".join(actual))
+                if len(etapas) > 1:
+                    yield etapas
+                etapas, actual = [], []
+                if c != ";":
+                    i += 1
+            elif c == "|":
+                etapas.append("".join(actual))
+                actual = []
+            else:
+                actual.append(c)
+            i += 1
+        etapas.append("".join(actual))
+        if len(etapas) > 1:
+            yield etapas
+
+
+def _borra_en_tuberia(command):
+    """ls ~ | xargs rm -rf, gci C:\\Users\\me | Remove-Item -Recurse: lists a protected target with
+    no filter and the next stage deletes what it gets."""
+    for etapas in _tuberias(command):
+        for k in range(1, len(etapas)):
+            antes = [p for p, _ in _palabras(etapas[k - 1])]
+            if not antes or _FILTRO.search(etapas[k - 1]):
+                continue
+            lista = _nombre(antes[0]) in _LISTA or etapas[k - 1].lstrip().startswith(("'", '"', "@("))
+            if not lista or not any(_protegida(p.lstrip("@")) for p in antes):
+                continue
+            ahora = [p.replace("\\", "") for p, frase in _palabras(etapas[k]) if not frase]
+            # The delete verb has to lead the stage (after xargs, %, foreach-object or a brace):
+            # a stray "del" or "rd" inside a long block doesn't count.
+            verbo = None
+            for j, p in enumerate(ahora[:6]):
+                if _VERBO_TUBERIA.fullmatch(p):
+                    verbo = j
+                    break
+                if not (p in _ANTES_VERBO or p.startswith(("-", "{"))):
+                    break
+            if verbo is not None and any(_RF_BORRA.fullmatch(p) for p in ahora[verbo + 1:]):
+                return True
+    return False
+
+
+def _bucle_borra(command):
+    """for d in ~ /c/work; do rm -rf $d; done and foreach ($d in 'C:\\') { Remove-Item -Recurse $d }."""
+    for patron in (_FOR_SH, _FOR_PS):
+        for m in patron.finditer(command):
+            if not any(_protegida(p) for p, _ in _palabras(m.group(2))):
+                continue
+            var = m.group(1)
+            for tramo in _tramos(m.group(3)):
+                tramo = re.sub(r"^\s*(?:do\b|\{)\s*", "", tramo)
+                if (_VERBO_BORRADO.match(tramo) and _RECURSIVO.search(tramo)
+                        and re.search(r"\$\{?" + re.escape(var) + r"\b", tramo)):
+                    return True
     return False
 
 
@@ -390,11 +716,11 @@ def _python_destructivo(cuerpo, nivel):
     if _PY_BORRA.search(cuerpo):
         for lit in literales:
             lit = lit.strip().lower()
-            if lit and (_RAIZ.fullmatch(lit) or _GIT_DIR.fullmatch(lit)):
+            if lit and _protegida(lit):
                 return PREFIX + " Blocked: deletes a drive root, the home folder or a .git folder."
     if re.search(r"os\.system|subprocess|popen", cuerpo):
         for lit in literales:
-            motivo = check_command(lit, nivel + 1)
+            motivo = _revisar(lit.lower(), nivel + 1)
             if motivo:
                 return motivo
     if _CREDENCIALES.search(cuerpo) and re.search(r"\bopen\(|read_text|read_bytes", cuerpo):

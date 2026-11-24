@@ -180,17 +180,76 @@ CLOSED_BYPASSES = [
     ("time a build", sh("time ./gradlew build"), ALLOW),
 ]
 
+# Disguised deletes: rm behind a wrapper, inside a string another program runs, with the verb
+# disguised, or split across a pipe or a loop. Most come from the adversarial corpus of nah (MIT).
+DISGUISED = [
+    ("timeout rm home", sh("timeout 5 rm -rf ~/*"), BLOCK),
+    ("eval rm", sh('eval "rm -rf $HOME"'), BLOCK),
+    ("eval string", sh('eval "rm -rf ~"'), BLOCK),
+    ("sudo -u rm", sh("sudo -u x rm -rf /c/Users/alice"), BLOCK),
+    ("setsid rm protected repo", sh("setsid rm -rf /c/work/main-repo"), BLOCK),
+    ("su -c rm", sh("su -c 'rm -rf ~'"), BLOCK),
+    ("trap rm", sh("trap 'rm -rf ~' EXIT"), BLOCK),
+    ("node execSync rm", sh("node -e \"require('child_process').execSync('rm -rf /c/work/main-repo')\""), BLOCK),
+    ("heredoc python os.system", sh("python - <<'EOF'\nimport os\nos.system(\"rm -rf ~/*\")\nEOF"), BLOCK),
+    ("heredoc python rmtree home", sh("python - <<'EOF'\nimport shutil\nshutil.rmtree('C:/Users/alice')\nEOF"), BLOCK),
+    ("subprocess list rm", sh("python -c \"import subprocess; subprocess.run(['rm','-rf','C:/Users/alice'])\""), BLOCK),
+    ("verb split by quotes", sh('"r""m" -rf ~'), BLOCK),
+    ("verb with backslash", sh("r\\m -rf ~"), BLOCK),
+    ("verb in a variable", sh("X=rm; $X -rf ~"), BLOCK),
+    ("unknown variable as command", sh("$X -rf ~"), BLOCK),
+    ("unknown variable as command -fr", sh("${CMD} -fr /c/work/main-repo"), BLOCK),
+    ("continued line", sh("rm \\\n  -rf \\\n  ~"), BLOCK),
+    ("path with ..", sh("rm -rf /c/Users/alice/../alice"), BLOCK),
+    ("path with /.", sh("rm -rf /c/work/main-repo/."), BLOCK),
+    ("quoted home with slash", sh('rm -rf "$HOME"/'), BLOCK),
+    ("wsl path", sh("rm -rf /mnt/c/Users/alice"), BLOCK),
+    ("variable with /*", sh("D=/c/Users/alice; rm -rf $D/*"), BLOCK),
+    ("variable built in pieces", sh("a=/c/Users; b=alice; rm -rf $a/$b"), BLOCK),
+    ("users folder", sh("rm -rf /c/Users"), BLOCK),
+    ("claude projects", sh("rm -rf ~/.claude/projects"), BLOCK),
+    ("xargs rm", sh("echo ~ | xargs rm -rf"), BLOCK),
+    ("find -delete on home", sh("find ~ -delete"), BLOCK),
+    ("for loop rm", sh('for d in ~ /c/work/main-repo; do rm -rf "$d"; done'), BLOCK),
+    ("ps Invoke-Expression", ps('Invoke-Expression "Remove-Item -Recurse -Force C:\\Users\\alice"'), BLOCK),
+    ("ps script block", ps("& { Remove-Item -Recurse -Force C:\\ }"), BLOCK),
+    ("ps gci into Remove-Item", ps("Get-ChildItem C:\\Users\\alice | Remove-Item -Recurse -Force"), BLOCK),
+    ("ps Get-Item into Remove-Item", ps("Get-Item C:\\Users\\alice | Remove-Item -Recurse -Force"), BLOCK),
+    ("ps foreach list", ps("foreach ($d in 'C:\\Users\\alice','C:\\x') { Remove-Item -Recurse -Force $d }"), BLOCK),
+    ("ps .NET delete", ps("[IO.Directory]::Delete('C:\\Users\\alice', $true)"), BLOCK),
+    ("ps localappdata", ps("Remove-Item -Recurse -Force $env:LOCALAPPDATA"), BLOCK),
+    ("ps backtick continuation", ps("Remove-Item -Recurse -Force `\n  C:\\Users\\alice"), BLOCK),
+    # These must still pass.
+    ("timeout rm work folder", sh("timeout 60 rm -rf ./build"), ALLOW),
+    ("commit naming the disguise", sh('git commit -m "guard: block timeout 5 rm -rf ~/* and eval rm -rf /"'), ALLOW),
+    ("report through heredoc", sh("cat > r.md <<'EOF'\n- eval rm -rf /c/work/main-repo and \"su -c 'rm -rf ~'\" used to pass\nEOF"), ALLOW),
+    ("find with a name filter", sh("find /c/work/main-repo -name '*.tmp' -delete"), ALLOW),
+    ("trap on a temp folder", sh("trap 'rm -rf \"$TMPDIR\"' EXIT"), ALLOW),
+    ("subfolder of protected repo", sh("rm -rf /c/work/main-repo/app/build"), ALLOW),
+    ("ps gci with filter", ps("Get-ChildItem C:\\Users\\alice -Filter *.tmp | Remove-Item -Force"), ALLOW),
+    ("ps gci into select", ps("Get-ChildItem C:\\work\\main-repo -Recurse | Select-Object -First 5"), ALLOW),
+    ("docker rm and npm rm", sh("docker rm -f cont; npm rm -g pkg"), ALLOW),
+    # False alarms measured on real commands: -Force and -Filter aren't -rf, "$x = ..." isn't an
+    # indirect command, and "\n" inside a string isn't drive /n.
+    ("ps assignment with -Force", ps("$sk = Get-ChildItem \"$env:USERPROFILE\\.claude\\skills\" -Force\n$sk.Count"), ALLOW),
+    ("ps assignment with -Filter", ps("$od = Get-ChildItem C:\\Users\\alice -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue"), ALLOW),
+    ("ps foreach over a list of roots", ps("$roots='C:\\work','C:\\work\\main-repo\\docs'\nforeach($r in $roots){ Get-ChildItem $r -Recurse -Depth 4 }"), ALLOW),
+    ("ps count files with -Force", ps("$f = Get-ChildItem C:\\work\\main-repo -Recurse -File -Force -ErrorAction SilentlyContinue\n$f.Count"), ALLOW),
+    ("text with del and an escape", sh("python - <<'EOF'\na = ('  \"pick del items, then: \"\\n'\n)\nEOF"), ALLOW),
+]
+
 # Known gaps: text matching can't see these. Documented in the README. They are kept as
 # expected failures so a future fix shows up as an unexpected success.
 KNOWN_GAPS = [
-    ("eval string", sh("eval \"rm -rf ~\""), BLOCK),
     ("command substitution", sh("echo $(rm -rf ~)"), BLOCK),
-    ("xargs target from stdin", sh("echo ~ | xargs rm -rf"), BLOCK),
-    ("ps pipeline into Remove-Item", ps("Get-Item C:\\Users\\alice | Remove-Item -Recurse -Force"), BLOCK),
-    ("ps .NET delete", ps("[IO.Directory]::Delete('C:\\Users\\alice', $true)"), BLOCK),
-    ("find -delete on home", sh("find ~ -delete"), BLOCK),
-    ("variable built in pieces", sh("a=/c/Users; b=alice; rm -rf $a/$b"), BLOCK),
     ("script written then run", sh("echo 'rm -rf ~' > x.sh && bash x.sh"), BLOCK),
+    ("encoded command into sh", sh("echo cm0gLXJmIH4K | base64 -d | sh"), BLOCK),
+    ("cd then relative wildcard", sh("cd ~ && rm -rf *"), BLOCK),
+    ("variable never set", sh("rm -rf $UNSET_VAR/"), BLOCK),
+    ("ps .Delete() method in a loop", ps("Get-ChildItem C:\\Users\\alice | ForEach-Object { $_.Delete() }"), BLOCK),
+    ("rsync --delete into home", sh("rsync -a --delete empty/ ~/"), BLOCK),
+    ("move the home away", sh("mv ~ /tmp/x"), BLOCK),
+    ("path read into a variable", sh('IFS=~ read -r a b <<< "x/y"; rm -rf "$a"'), BLOCK),
 ]
 
 
@@ -206,6 +265,9 @@ class GuardTest(unittest.TestCase):
 
     def test_closed_bypasses(self):
         self._run(CLOSED_BYPASSES)
+
+    def test_disguised(self):
+        self._run(DISGUISED)
 
     def test_cli_check(self):
         self.assertEqual(guard.main(["--check", "rm", "-rf", "~"]), 2)
