@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-command-guard"
+version = "0.1.0"
+description = "A PreToolUse hook that stops a coding agent from running deletes and credential reads you can't take back"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+keywords = ["claude-code", "hook", "coding-agent", "security", "shell"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dheightsan/agent-command-guard"
+Issues = "https://github.com/Dheightsan/agent-command-guard/issues"
+Security = "https://github.com/Dheightsan/agent-command-guard/blob/main/SECURITY.md"
+
+[project.scripts]
+agent-command-guard = "guard:main"
+
+[tool.setuptools]
+py-modules = ["guard"]
