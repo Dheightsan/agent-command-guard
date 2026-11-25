@@ -22,7 +22,11 @@ Mentioning a dangerous command inside a commit message, a grep or a heredoc does
 
 ## Install (Claude Code)
 
-Copy `guard.py` somewhere stable and add it to `~/.claude/settings.json`:
+```
+pip install agent-command-guard
+```
+
+Then add it to `~/.claude/settings.json`. If you'd rather not use pip, copy `guard.py` somewhere stable and use `python -S /path/to/guard.py` as the command:
 
 ```json
 {
@@ -30,7 +34,7 @@ Copy `guard.py` somewhere stable and add it to `~/.claude/settings.json`:
     "PreToolUse": [
       {
         "matcher": "Bash|PowerShell|Read|Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [{ "type": "command", "command": "python -S /path/to/guard.py" }]
+        "hooks": [{ "type": "command", "command": "agent-command-guard" }]
       }
     ]
   }
@@ -42,7 +46,7 @@ Exit code 2 blocks the call and Claude Code shows the reason to the model. If th
 Other agents or scripts can call it directly:
 
 ```
-python guard.py --check "rm -rf ~"
+agent-command-guard --check "rm -rf ~"
 ```
 
 It prints the reason and exits with 2, or prints `allowed` and exits with 0.
